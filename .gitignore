@@ -1,0 +1,7 @@
+/target/
+/.work/
+/.cache/
+/.scannerwork/
+*.class
+*.log
+.env

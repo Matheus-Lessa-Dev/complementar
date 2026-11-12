@@ -1,0 +1,251 @@
+name: Pipeline de Evolucao Segura (CI/CD)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  analise_codigo_e_seguranca:
+    name: Testes, Sonar Quality Gate e Trivy de dependencias
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout do codigo e historico completo
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validar configuracao de release
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          for variable in SONAR_PROJECT_KEY SONAR_ORGANIZATION DOCKER_IMAGE SONAR_TOKEN; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Configuracao obrigatoria ausente: $variable"
+              exit 1
+            fi
+          done
+          if [[ ! "$RELEASE_TAG" =~ ^v[A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo '::error::A tag v* precisa ser uma tag Docker valida (ate 128 caracteres).'
+            exit 1
+          fi
+          if [[ ! "$DOCKER_IMAGE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+            echo '::error::DOCKER_IMAGE deve ser usuario/repositorio do Docker Hub, em minusculas.'
+            exit 1
+          fi
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Compilar, testar, limitar complexidade e gerar cobertura
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Analisar no Sonar e aguardar aprovacao real do Quality Gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mvn --batch-mode --no-transfer-progress sonar:sonar \
+            "-Dsonar.projectKey=$SONAR_PROJECT_KEY" \
+            "-Dsonar.organization=$SONAR_ORGANIZATION" \
+            "-Dsonar.projectVersion=$RELEASE_TAG" \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.qualitygate.timeout=600
+
+      - name: Trivy - dependencias diretas e transitivas (HIGH e CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          scan-type: fs
+          scan-ref: .
+          skip-dirs: .git,.cache,.work
+          scanners: vuln
+          vuln-type: library
+          format: table
+          output: target/trivy-dependencies.txt
+          severity: HIGH,CRITICAL
+          ignore-unfixed: 'false'
+          exit-code: '1'
+          timeout: 10m
+
+      - name: Exibir tabela Trivy de dependencias nos logs
+        if: ${{ always() }}
+        run: |
+          if [[ -f target/trivy-dependencies.txt ]]; then
+            cat target/trivy-dependencies.txt
+          fi
+
+      - name: Guardar testes, cobertura e relatorio de dependencias
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: analise-codigo-e-dependencias
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+            target/checkstyle-result.xml
+            target/trivy-dependencies.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  build_e_scan_imagem:
+    name: Build local e Trivy da imagem Docker
+    needs: analise_codigo_e_seguranca
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image_id: ${{ steps.image_identity.outputs.image_id }}
+    steps:
+      - name: Checkout do codigo
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Construir e carregar imagem sem publicar
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          load: true
+          pull: true
+          platforms: linux/amd64
+          tags: release-candidate:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+      - name: Smoke test da aplicacao na imagem
+        env:
+          CANDIDATE: release-candidate:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          timeout 60s docker run --rm --network none "$CANDIDATE" > reports/docker-smoke.txt
+          cat reports/docker-smoke.txt
+          test "$(grep -c 'RECIBO DE VENDA' reports/docker-smoke.txt)" -eq 3
+          grep -Fq 'TOTAL A PAGAR: R$ 372.0' reports/docker-smoke.txt
+          grep -Fq 'TOTAL A PAGAR: R$ 387.0' reports/docker-smoke.txt
+          grep -Fq 'TOTAL A PAGAR: R$ 422.0' reports/docker-smoke.txt
+
+      - name: Trivy - imagem final, sistema operacional e bibliotecas
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          scan-type: image
+          image-ref: release-candidate:${{ github.sha }}
+          scanners: vuln
+          vuln-type: os,library
+          format: table
+          output: reports/trivy-image.txt
+          severity: HIGH,CRITICAL
+          ignore-unfixed: 'false'
+          exit-code: '1'
+          timeout: 10m
+
+      - name: Exibir tabela Trivy da imagem nos logs
+        if: ${{ always() }}
+        run: |
+          if [[ -f reports/trivy-image.txt ]]; then
+            cat reports/trivy-image.txt
+          fi
+
+      - name: Guardar relatorios da imagem
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: relatorios-imagem
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Exportar exatamente a imagem aprovada
+        id: image_identity
+        env:
+          CANDIDATE: release-candidate:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          echo "image_id=$(docker image inspect --format '{{.Id}}' "$CANDIDATE")" >> "$GITHUB_OUTPUT"
+          docker save --output image.tar "$CANDIDATE"
+          sha256sum image.tar > image.tar.sha256
+
+      - name: Guardar imagem aprovada para publicacao
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: imagem-aprovada
+          path: |
+            image.tar
+            image.tar.sha256
+          compression-level: 0
+          retention-days: 1
+
+  publicar_docker_hub:
+    name: Publicar imagem aprovada no Docker Hub
+    needs: [analise_codigo_e_seguranca, build_e_scan_imagem]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Baixar a imagem aprovada nesta execucao
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: imagem-aprovada
+
+      - name: Conferir integridade e identidade da imagem
+        env:
+          CANDIDATE: release-candidate:${{ github.sha }}
+          EXPECTED_IMAGE_ID: ${{ needs.build_e_scan_imagem.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          sha256sum --check image.tar.sha256
+          docker load --input image.tar
+          test -n "$EXPECTED_IMAGE_ID"
+          test "$(docker image inspect --format '{{.Id}}' "$CANDIDATE")" = "$EXPECTED_IMAGE_ID"
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Publicar a mesma imagem, sem reconstruir
+        env:
+          CANDIDATE: release-candidate:${{ github.sha }}
+          DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          destination="docker.io/$DOCKER_IMAGE:$RELEASE_TAG"
+          docker tag "$CANDIDATE" "$destination"
+          docker push "$destination"
+          {
+            echo "Imagem publicada: $destination"
+            echo "Codigo: $GITHUB_SHA"
+            docker image inspect --format 'RepoDigests: {{json .RepoDigests}}' "$destination"
+          } >> "$GITHUB_STEP_SUMMARY"
